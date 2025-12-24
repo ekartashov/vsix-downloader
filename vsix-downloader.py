@@ -581,4 +581,6 @@ if __name__ == "__main__":
         # VsixSpec("somepublisher.universalextension", "1.2.3", None),
     ]
 
-    download_many(EXTENSIONS)
+    root_dir = Path(__file__).resolve().parent
+    vscode_exts_dir = root_dir / "vscode_exts/"
+    download_many(EXTENSIONS, dest_dir=vscode_exts_dir)
