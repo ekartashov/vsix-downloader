@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import gzip
 import logging
 import re
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Optional
+from typing import Callable, Iterable, Iterator, Mapping, Optional, Tuple
 from urllib.parse import unquote
 from urllib.request import Request, urlopen
 
@@ -14,7 +16,7 @@ from urllib.request import Request, urlopen
 # =============================================================================
 
 logger = logging.getLogger(__name__)
-logger.addHandler(logging.NullHandler())  # prevents "No handler found" warnings in libraries
+logger.addHandler(logging.NullHandler())  # avoids "No handler found" warnings in libraries
 
 
 def configure_basic_logging(level: int = logging.INFO) -> None:
@@ -65,8 +67,6 @@ def build_vspackage_url(spec: VsixSpec, base: str = MARKETPLACE_VSPACKAGE_BASE) 
     """
     Build the Marketplace 'vspackage' URL for the given extension spec.
 
-    The returned URL is directly downloadable and typically returns the VSIX payload.
-
     Args:
         spec: Extension specification.
         base: Base URL of the Marketplace gallery API.
@@ -75,7 +75,7 @@ def build_vspackage_url(spec: VsixSpec, base: str = MARKETPLACE_VSPACKAGE_BASE) 
         A fully qualified URL to the extension 'vspackage' endpoint.
 
     Raises:
-        ValueError: If spec.unique_identifier is not "publisher.package".
+        ValueError: If spec.unique_identifier is not "publisher.extensionName".
     """
     publisher, package = spec.unique_identifier.split(".", 1)
     url = f"{base}/publishers/{publisher}/vsextensions/{package}/{spec.version}/vspackage"
@@ -85,10 +85,19 @@ def build_vspackage_url(spec: VsixSpec, base: str = MARKETPLACE_VSPACKAGE_BASE) 
 
 
 # =============================================================================
-# Filename handling
+# Header + filename handling
 # =============================================================================
 
 _CD_FILENAME_RE = re.compile(r'filename="?(?P<name>[^";]+)"?', re.IGNORECASE)
+
+
+def _header_get(headers: Mapping[str, str], name: str) -> str | None:
+    """Case-insensitive mapping access for HTTP headers."""
+    needle = name.lower()
+    for k, v in headers.items():
+        if k.lower() == needle:
+            return v
+    return None
 
 
 def filename_from_content_disposition(header: str | None) -> str | None:
@@ -124,7 +133,6 @@ def filename_from_content_disposition(header: str | None) -> str | None:
             return unquote(enc)
         return unquote(v)
 
-    # Fall back to filename=
     m = _CD_FILENAME_RE.search(header)
     if m:
         return m.group("name")
@@ -144,7 +152,6 @@ def safe_filename(name: str) -> str:
     Returns:
         A sanitized filename (single path segment).
     """
-    # Keep only the final path component and strip common dangerous characters.
     return Path(name).name.replace("\x00", "").strip() or "download.vsix"
 
 
@@ -166,9 +173,6 @@ def ensure_vsix_suffix(path: Path) -> Path:
     """
     Ensure a path ends with a .vsix suffix.
 
-    The Marketplace may return a payload that browsers/tools label as .zip.
-    A VSIX is a zip container, so renaming to .vsix is typically sufficient.
-
     Args:
         path: Output file path.
 
@@ -183,8 +187,25 @@ def ensure_vsix_suffix(path: Path) -> Path:
     return path.with_suffix(".vsix")
 
 
+def resolve_vsix_filename(spec: VsixSpec, headers: Mapping[str, str]) -> str:
+    """
+    Decide the final VSIX filename.
+
+    Preference order:
+      1) Server-provided Content-Disposition filename (sanitized)
+      2) Deterministic fallback derived from spec
+
+    Returns:
+        A filename that ends with `.vsix`.
+    """
+    cd = _header_get(headers, "Content-Disposition")
+    server_name = filename_from_content_disposition(cd)
+    chosen = safe_filename(server_name) if server_name else default_vsix_name(spec)
+    return ensure_vsix_suffix(Path(chosen)).name
+
+
 # =============================================================================
-# Download mechanics
+# Streaming / atomic I/O utilities
 # =============================================================================
 
 def iter_response_chunks(resp, chunk_size: int = 1024 * 1024) -> Iterator[bytes]:
@@ -203,6 +224,16 @@ def iter_response_chunks(resp, chunk_size: int = 1024 * 1024) -> Iterator[bytes]
         if not chunk:
             break
         yield chunk
+
+
+def iter_file_chunks(path: Path, chunk_size: int = 1024 * 1024) -> Iterator[bytes]:
+    """Iterate a file on disk in fixed-size chunks."""
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
 
 
 def atomic_write_bytes(dest: Path, data_iter: Iterable[bytes]) -> int:
@@ -229,99 +260,304 @@ def atomic_write_bytes(dest: Path, data_iter: Iterable[bytes]) -> int:
     return total
 
 
+def _read_prefix(path: Path, n: int = 16) -> bytes:
+    with open(path, "rb") as f:
+        return f.read(n)
+
+
+def is_zip_file(path: Path) -> bool:
+    """
+    Return True if the file at `path` is a ZIP container.
+
+    Args:
+        path: Path to a file.
+
+    Returns:
+        True if ZIP, False otherwise.
+    """
+    return zipfile.is_zipfile(path)
+
+
+# =============================================================================
+# Download + VSIX production pipeline
+# =============================================================================
+
+def download_vspackage_payload(
+    url: str,
+    *,
+    spec: VsixSpec,
+    dest_dir: Path,
+    user_agent: str,
+    opener: Callable[[Request], object],
+    log: logging.Logger,
+) -> Tuple[Path, Path, Mapping[str, str]]:
+    """
+    Download the Marketplace payload into a `.download` file.
+
+    Important detail:
+      The output filename is resolved from response headers *before* streaming the body,
+      so we never end up "switching" paths after the download.
+
+    Args:
+        url: Download URL (vspackage endpoint).
+        spec: The extension spec.
+        dest_dir: Destination directory.
+        user_agent: User-Agent header value.
+        opener: Injectable opener for testability.
+        log: Logger instance.
+
+    Returns:
+        (final_vsix_path, raw_download_path, headers)
+
+    Raises:
+        URLError / HTTPError: from urllib on network/HTTP failures.
+        OSError: on file system errors.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    req = Request(
+        url,
+        headers={
+            "User-Agent": user_agent,
+            # Request identity encoding to avoid gzip surprises where possible.
+            # We still handle gzip defensively in normalize_to_zip().
+            "Accept-Encoding": "identity",
+        },
+    )
+
+    log.info("HTTP GET: %s", url)
+
+    with opener(req) as resp:  # type: ignore[call-arg]
+        # urllib headers are typically an email.message.Message which supports .items()
+        hdrs: Mapping[str, str] = dict(getattr(resp, "headers", {}).items())
+
+        final_name = resolve_vsix_filename(spec, hdrs)
+        final_vsix = ensure_vsix_suffix(dest_dir / final_name)
+        raw_download = final_vsix.with_suffix(final_vsix.suffix + ".download")
+
+        log.info("Saving payload to: %s", raw_download)
+        total = atomic_write_bytes(raw_download, iter_response_chunks(resp))
+        log.info("Downloaded %d bytes -> %s", total, raw_download)
+
+    return final_vsix, raw_download, hdrs
+
+
+def normalize_to_zip(src: Path, dest: Path, headers: Mapping[str, str], *, log: logging.Logger) -> None:
+    """
+    Normalize a downloaded payload into a ZIP file.
+
+    The Marketplace typically returns a VSIX (a ZIP container). In practice you may
+    encounter:
+      - gzip-wrapped payloads, or
+      - non-zip responses (HTML error pages, wrong version/targetPlatform)
+
+    This function:
+      - detects gzip via Content-Encoding and magic bytes
+      - decompresses if needed (streaming)
+      - otherwise copies bytes as-is
+      - validates ZIP-ness of the result
+
+    Args:
+        src: Downloaded payload path.
+        dest: Destination path for the normalized ZIP bytes.
+        headers: HTTP response headers.
+        log: Logger.
+
+    Raises:
+        ValueError: If the normalized output is not a ZIP file.
+    """
+    content_encoding = (_header_get(headers, "Content-Encoding") or "").lower().strip()
+
+    magic = _read_prefix(src, 2)
+    is_gzip_magic = magic == b"\x1f\x8b"
+    is_gzip_header = "gzip" in content_encoding
+
+    if is_gzip_magic or is_gzip_header:
+        log.info("Normalizing: detected gzip-encoded payload; decompressing")
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with gzip.open(src, "rb") as zin, open(tmp, "wb") as zout:
+            while True:
+                chunk = zin.read(1024 * 1024)
+                if not chunk:
+                    break
+                zout.write(chunk)
+        tmp.replace(dest)
+    else:
+        log.info("Normalizing: payload is not gzip-encoded; copying as-is")
+        atomic_write_bytes(dest, iter_file_chunks(src))
+
+    if not is_zip_file(dest):
+        head = _read_prefix(dest, 64)
+        raise ValueError(
+            "Downloaded payload is not a ZIP/VSIX file after normalization. "
+            "This usually means the request returned an HTML error page "
+            "(wrong version / wrong targetPlatform / endpoint changed). "
+            f"First bytes: {head!r}"
+        )
+
+
+def repack_zip(src_zip: Path, dest_zip: Path, *, log: logging.Logger) -> None:
+    """
+    Re-pack an existing ZIP file into a fresh ZIP container.
+
+    This is a pragmatic “make it definitely a normal ZIP” step. It can help when:
+      - you want consistent compression,
+      - you want to ensure the output is a conventional ZIP container.
+
+    Args:
+        src_zip: Source ZIP file.
+        dest_zip: Destination ZIP file (often `*.vsix`).
+        log: Logger.
+
+    Raises:
+        ValueError: If src_zip is not a ZIP file.
+    """
+    if not is_zip_file(src_zip):
+        head = _read_prefix(src_zip, 64)
+        raise ValueError(f"Cannot repack: source is not a ZIP file. First bytes: {head!r}")
+
+    tmp = dest_zip.with_suffix(dest_zip.suffix + ".part")
+    dest_zip.parent.mkdir(parents=True, exist_ok=True)
+
+    log.info("Repacking ZIP -> VSIX container")
+    with zipfile.ZipFile(src_zip, "r") as zin, zipfile.ZipFile(
+        tmp, "w", compression=zipfile.ZIP_DEFLATED
+    ) as zout:
+        for info in zin.infolist():
+            data = b"" if info.is_dir() else zin.read(info.filename)
+
+            # Preserve essential metadata where practical.
+            new_info = zipfile.ZipInfo(filename=info.filename, date_time=info.date_time)
+            new_info.external_attr = info.external_attr
+            new_info.internal_attr = info.internal_attr
+            new_info.create_system = info.create_system
+            new_info.create_version = info.create_version
+            new_info.extract_version = info.extract_version
+            new_info.flag_bits = info.flag_bits
+            new_info.volume = info.volume
+            new_info.comment = info.comment
+            new_info.extra = info.extra
+
+            zout.writestr(new_info, data)
+
+    tmp.replace(dest_zip)
+
+
+# =============================================================================
+# Public API
+# =============================================================================
+
 def download_vsix(
     spec: VsixSpec,
     dest_dir: Path | None = None,
     *,
+    repack: bool = True,
     user_agent: str = "vsix-downloader/1.0 (+python urllib)",
     opener: Callable[[Request], object] = urlopen,
     log: Optional[logging.Logger] = None,
 ) -> Path:
     """
-    Download a VSIX specified by `spec` into `dest_dir` (default: current working directory).
+    Download an extension package and produce an installable `.vsix`.
 
-    Behaviour:
-      - Builds the Marketplace vspackage URL.
-      - Requests the file (following redirects handled by urllib).
-      - Chooses the output name from Content-Disposition if available; otherwise a fallback.
-      - Sanitizes the filename.
-      - Forces the output extension to .vsix.
-      - Writes atomically (download to .part then rename).
+    Pipeline:
+      1) Open URL and resolve the output filename from headers (before streaming)
+      2) Download raw payload to `<name>.vsix.download`
+      3) Normalize payload into ZIP bytes
+      4) Optionally re-pack into a clean ZIP container
+      5) Write final `*.vsix` and clean up temporary files
 
     Args:
         spec: Extension spec to download.
-        dest_dir: Destination directory. Defaults to Path.cwd().
+        dest_dir: Destination directory (defaults to current working directory).
+        repack: If True (default), re-pack the normalized ZIP into a fresh container.
         user_agent: User-Agent header to send.
         opener: Injectable opener for testability (defaults to urllib.request.urlopen).
         log: Optional logger (defaults to this module's logger).
 
     Returns:
-        Path to the downloaded file.
+        Path to the resulting `.vsix` file.
 
     Raises:
+        ValueError: If the final artifact cannot be made into a ZIP/VSIX container.
         URLError / HTTPError: On network or HTTP failures (from urllib).
         OSError: On file system errors.
-        ValueError: If spec.unique_identifier is malformed.
     """
     log = log or logger
     dest_dir = dest_dir or Path.cwd()
+    dest_dir.mkdir(parents=True, exist_ok=True)
 
     url = build_vspackage_url(spec)
-    log.info("Preparing download: %s@%s", spec.unique_identifier, spec.version)
-    log.info("URL: %s", url)
+    log.info("Preparing: %s@%s", spec.unique_identifier, spec.version)
 
-    req = Request(url, headers={"User-Agent": user_agent})
+    final_vsix, raw_download, headers = download_vspackage_payload(
+        url,
+        spec=spec,
+        dest_dir=dest_dir,
+        user_agent=user_agent,
+        opener=opener,
+        log=log,
+    )
 
-    with opener(req) as resp:  # type: ignore[call-arg]
-        cd = getattr(resp, "headers", {}).get("Content-Disposition") if hasattr(resp, "headers") else None
-        server_name = filename_from_content_disposition(cd)
-        chosen_name = safe_filename(server_name) if server_name else default_vsix_name(spec)
+    normalized_zip = final_vsix.with_suffix(final_vsix.suffix + ".normalized.zip")
 
-        out_path = ensure_vsix_suffix(dest_dir / chosen_name)
-        log.info("Saving to: %s", out_path)
+    log.info("Validating/normalizing payload into a ZIP container")
+    normalize_to_zip(raw_download, normalized_zip, headers, log=log)
 
-        total = atomic_write_bytes(out_path, iter_response_chunks(resp))
-        log.info("Done (%d bytes): %s", total, out_path)
+    log.info("Producing final VSIX: %s", final_vsix)
+    if repack:
+        repack_zip(normalized_zip, final_vsix, log=log)
+    else:
+        tmp = final_vsix.with_suffix(final_vsix.suffix + ".part")
+        atomic_write_bytes(tmp, iter_file_chunks(normalized_zip))
+        tmp.replace(final_vsix)
 
-    return out_path
+    # Cleanup (best-effort)
+    for p in (raw_download, normalized_zip):
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            log.warning("Could not remove temporary file: %s", p)
+
+    log.info("Done: %s", final_vsix)
+    return final_vsix
 
 
 def download_many(
     specs: Iterable[VsixSpec],
     dest_dir: Path | None = None,
     *,
+    repack: bool = True,
     user_agent: str = "vsix-downloader/1.0 (+python urllib)",
     opener: Callable[[Request], object] = urlopen,
     log: Optional[logging.Logger] = None,
 ) -> list[Path]:
     """
-    Download multiple VSIX files.
-
-    This is a thin orchestration layer around `download_vsix()`, keeping the
-    underlying download logic reusable and testable.
+    Download multiple extensions and produce installable `.vsix` files.
 
     Args:
         specs: Iterable of extension specs.
         dest_dir: Destination directory (defaults to CWD).
+        repack: If True (default), re-pack each normalized ZIP into a fresh container.
         user_agent: User-Agent header.
         opener: Injectable opener for testability.
         log: Optional logger.
 
     Returns:
-        List of paths to downloaded files.
+        List of paths to downloaded `.vsix` files.
     """
     log = log or logger
-    results: list[Path] = []
-
     specs_list = list(specs)
     log.info("Starting batch download (%d extension(s))", len(specs_list))
 
+    results: list[Path] = []
     for i, spec in enumerate(specs_list, start=1):
         log.info("(%d/%d) %s", i, len(specs_list), spec.unique_identifier)
         results.append(
             download_vsix(
                 spec,
                 dest_dir=dest_dir,
+                repack=repack,
                 user_agent=user_agent,
                 opener=opener,
                 log=log,
@@ -341,7 +577,8 @@ if __name__ == "__main__":
 
     EXTENSIONS: list[VsixSpec] = [
         VsixSpec("ms-vscode.cpptools", "1.30.0", "linux-x64"),
-        # VsixSpec("platformio.platformio-ide", "3.3.4", "linux-x64"),
+        # VsixSpec("somepublisher.someextension", "1.2.3", "linux-x64"),
+        # VsixSpec("somepublisher.universalextension", "1.2.3", None),
     ]
 
     download_many(EXTENSIONS)
